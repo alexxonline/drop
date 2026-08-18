@@ -150,20 +150,26 @@ function pickRoot(paths: string[]): string {
   return prefix + indexes[0].slice(0, -'index.html'.length)
 }
 
-export interface SiteFile {
+export interface SiteEntry {
   path: string
-  data: Buffer
+  /**
+   * Decompresses this entry. Deferred so the caller decides how many entries
+   * are in memory at once — an archive may hold MAX_ZIP_TOTAL_BYTES of them.
+   */
+  read(): Promise<Buffer>
 }
 
 export interface ExtractedSite {
-  files: SiteFile[]
+  entries: SiteEntry[]
   totalUncompressed: number
+  /** Releases the archive. Every `read()` must have settled first. */
+  close(): void
 }
 
 /**
- * Validates and extracts a zip into a flat list of `{ path, data }` ready for
- * upload. Every limit is checked against the central directory before a single
- * byte is decompressed.
+ * Validates a zip and returns its files as readers, ready for upload. Every
+ * limit is checked against the central directory before a single byte is
+ * decompressed; the bytes themselves are produced on demand.
  */
 export async function extractSite(buffer: Buffer): Promise<ExtractedSite> {
   const zipfile = await openZip(buffer)
@@ -203,13 +209,26 @@ export async function extractSite(buffer: Buffer): Promise<ExtractedSite> {
       .map((c) => ({ entry: c.entry, path: c.path.slice(root.length) }))
       .filter((c) => c.path !== '')
 
-    const files: SiteFile[] = []
-    for (const { entry, path } of selected) {
-      files.push({ path, data: await readEntryBuffer(zipfile, entry) })
+    // Reads are serialised onto one chain: concurrent `openReadStream` calls on
+    // a single archive are not worth relying on, and one decompression at a
+    // time is the point — the caller can still overlap the uploads.
+    let chain: Promise<unknown> = Promise.resolve()
+    const readInTurn = (entry: Entry): Promise<Buffer> => {
+      const next = chain.then(
+        () => readEntryBuffer(zipfile, entry),
+        () => readEntryBuffer(zipfile, entry),
+      )
+      chain = next.catch(() => {})
+      return next
     }
 
-    return { files, totalUncompressed }
-  } finally {
+    return {
+      entries: selected.map(({ entry, path }) => ({ path, read: () => readInTurn(entry) })),
+      totalUncompressed,
+      close: () => zipfile.close(),
+    }
+  } catch (err) {
     zipfile.close()
+    throw err
   }
 }

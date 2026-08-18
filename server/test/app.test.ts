@@ -89,6 +89,9 @@ mock.module(new URL('../src/r2.ts', import.meta.url).href, {
 })
 
 const { buildApp } = await import('../src/app.ts')
+const { config } = await import('../src/config.ts')
+const { withUploadBudget } = await import('../src/uploads.ts')
+const { extractSite } = await import('../src/zip.ts')
 const { default: db, drops } = await import('../src/db.ts')
 const { startSweeper } = await import('../src/sweeper.ts')
 
@@ -610,4 +613,185 @@ test('share links are not served on the content host', async () => {
   const drop = await uploadOk('photo.png', await samplePng())
   const res = await app.inject({ method: 'GET', url: `/d/${drop.id}`, headers: contentHost })
   assert.equal(res.statusCode, 404)
+})
+
+// --- the origin split --------------------------------------------------------
+// SPEC.md §7: user content must never be reachable on the app origin, whatever
+// shape the request arrives in.
+
+test('percent-encoded content paths do not reach the app origin', async () => {
+  const drop = await uploadOk('evil.html', '<script>alert(1)</script>')
+
+  // The router decodes before it matches, so %73 and %66 land on the `/s/` and
+  // `/f/` handlers while reading as app paths to a raw prefix check.
+  for (const url of [`/%73/${drop.id}/`, `/%66/${drop.id}`, `/%73/${drop.id}/index.html`]) {
+    const res = await app.inject({ method: 'GET', url, headers: appHost })
+    assert.equal(res.statusCode, 404, `${url} was served on the app host`)
+    assert.ok(!res.body.includes('alert(1)'), `${url} leaked user content onto the app origin`)
+  }
+})
+
+test('an X-Forwarded-Host header cannot move a route to the other origin', async () => {
+  const drop = await uploadOk('evil.html', '<script>alert(1)</script>')
+
+  const content = await app.inject({
+    method: 'GET',
+    url: `/s/${drop.id}/`,
+    headers: { ...appHost, 'x-forwarded-host': 'content.test' },
+  })
+  assert.equal(content.statusCode, 404)
+  assert.ok(!content.body.includes('alert(1)'))
+
+  const api = await app.inject({
+    method: 'GET',
+    url: '/api/me',
+    headers: { ...contentHost, 'x-forwarded-host': 'app.test', cookie: await sessionCookie() },
+  })
+  assert.equal(api.statusCode, 404)
+})
+
+test('the host guard holds even when a content route is reached directly', async () => {
+  const drop = await uploadOk('page.html', '<p>hi</p>')
+
+  // Same route, both hostnames: only the content host may serve it.
+  const onContent = await app.inject({ method: 'GET', url: `/s/${drop.id}/`, headers: contentHost })
+  assert.equal(onContent.statusCode, 200)
+
+  const onApp = await app.inject({ method: 'GET', url: `/s/${drop.id}/`, headers: appHost })
+  assert.equal(onApp.statusCode, 404)
+})
+
+test('a backslash in `next` cannot redirect off-origin', async () => {
+  // Browsers normalise `\` to `/` for special schemes, so `/\evil.com` resolves
+  // to `//evil.com` — an origin change a `startsWith('//')` check misses.
+  for (const next of ['/\\evil.com', '/\\/evil.com', '//evil.com', 'https://evil.com']) {
+    const res = await app.inject({
+      method: 'GET',
+      url: `/auth/google/login?next=${encodeURIComponent(next)}`,
+      headers: appHost,
+    })
+    assert.equal(res.statusCode, 302)
+
+    const cookie = decodeURIComponent(String(res.headers['set-cookie']).split(';')[0])
+    const pending = JSON.parse(cookie.slice(cookie.indexOf('{'), cookie.lastIndexOf('}') + 1))
+    assert.equal(pending.next, '/', `next=${next} survived as ${pending.next}`)
+  }
+})
+
+test('a relative `next` still round-trips', async () => {
+  const res = await app.inject({
+    method: 'GET',
+    url: `/auth/google/login?next=${encodeURIComponent('/files?sort=new#top')}`,
+    headers: appHost,
+  })
+
+  const cookie = decodeURIComponent(String(res.headers['set-cookie']).split(';')[0])
+  const pending = JSON.parse(cookie.slice(cookie.indexOf('{'), cookie.lastIndexOf('}') + 1))
+  assert.equal(pending.next, '/files?sort=new#top')
+})
+
+// --- limits ------------------------------------------------------------------
+
+test('every route is rate limited, except the health check', async () => {
+  const drop = await uploadOk('limits.txt', 'hi')
+
+  // Previously only /api/uploads carried a limit; everything else was open.
+  const api = await app.inject({ method: 'GET', url: '/api/config', headers: appHost })
+  assert.equal(api.headers['x-ratelimit-limit'], '600')
+
+  // Content routes fan out per asset, so they get their own higher ceiling.
+  const content = await app.inject({ method: 'GET', url: `/f/${drop.id}`, headers: contentHost })
+  assert.equal(content.headers['x-ratelimit-limit'], '1200')
+
+  // The container health check runs on a fixed interval and must never be cut off.
+  const health = await app.inject({ method: 'GET', url: '/health', headers: appHost })
+  assert.equal(health.statusCode, 200)
+  assert.equal(health.headers['x-ratelimit-limit'], undefined)
+})
+
+test('a route over its limit answers 429', async () => {
+  // From an address of its own, so the rest of the suite keeps its own budget.
+  const from = '203.0.113.55'
+  let last = 0
+
+  for (let i = 0; i < 61; i++) {
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/uploads',
+      headers: appHost,
+      remoteAddress: from,
+    })
+    last = res.statusCode
+  }
+
+  assert.equal(last, 429, 'the 61st upload in a minute should be refused')
+})
+
+test('an oversized Content-Length is refused before the body is read', async () => {
+  const { body, contentType } = multipart('big.txt', 'still small')
+
+  const res = await app.inject({
+    method: 'POST',
+    url: '/api/uploads',
+    headers: {
+      ...appHost,
+      cookie: await sessionCookie(),
+      'content-type': contentType,
+      'content-length': String(200 * 1024 * 1024),
+    },
+    payload: body,
+  })
+
+  assert.equal(res.statusCode, 413)
+  assert.match(res.json().message, /larger than the 10 MB limit/)
+})
+
+test('upload buffering is capped by a byte budget, not a request count', async () => {
+  let live = 0
+  let peak = 0
+
+  // The budget is three times MAX_UPLOAD_BYTES, so five max-size uploads must
+  // queue rather than all buffer at once — and all five must still finish.
+  const one = () =>
+    withUploadBudget(config.maxUploadBytes, async () => {
+      live += 1
+      peak = Math.max(peak, live)
+      await new Promise((resolve) => setTimeout(resolve, 5))
+      live -= 1
+    })
+
+  await Promise.all([one(), one(), one(), one(), one()])
+
+  assert.equal(live, 0)
+  assert.ok(peak <= 3, `${peak} uploads buffered at once, expected at most 3`)
+})
+
+test('zip entries are decompressed on demand', async () => {
+  const zip = buildZip([
+    { name: 'index.html', data: '<h1>hello</h1>' },
+    { name: 'app.js', data: 'console.log(1)' },
+    { name: 'style.css', data: 'body{}' },
+  ])
+
+  const site = await extractSite(zip)
+  try {
+    assert.equal(site.entries.length, 3)
+    // Readers, not bytes: nothing is held in memory until it is asked for.
+    assert.deepEqual(
+      site.entries.map((e) => e.path).sort(),
+      ['app.js', 'index.html', 'style.css'],
+    )
+    assert.ok(site.entries.every((e) => typeof e.read === 'function'))
+
+    // Concurrent reads are serialised onto one chain; they must still each
+    // return their own entry's bytes.
+    const [html, js] = await Promise.all([
+      site.entries.find((e) => e.path === 'index.html')!.read(),
+      site.entries.find((e) => e.path === 'app.js')!.read(),
+    ])
+    assert.equal(html.toString(), '<h1>hello</h1>')
+    assert.equal(js.toString(), 'console.log(1)')
+  } finally {
+    site.close()
+  }
 })

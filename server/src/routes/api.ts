@@ -2,11 +2,25 @@ import type { FastifyInstance } from 'fastify'
 import { config, ttlChoices, clampTtl } from '../config.ts'
 import { drops } from '../db.ts'
 import { requireAuth, requireSameOrigin } from '../auth.ts'
-import { storeUpload, destroyDrop, toOwnerView, toPublicView, UploadError } from '../uploads.ts'
+import {
+  storeUpload,
+  destroyDrop,
+  toOwnerView,
+  toPublicView,
+  withUploadBudget,
+  UploadError,
+} from '../uploads.ts'
 import { ACCEPTED_EXTENSIONS } from '../types.ts'
 
 interface IdParams {
   id: string
+}
+
+/** Room for multipart framing on top of the file itself. */
+const MULTIPART_OVERHEAD = 1024 * 1024
+
+function tooLargeMessage(): string {
+  return `That file is larger than the ${Math.floor(config.maxUploadBytes / 1024 / 1024)} MB limit.`
 }
 
 export async function apiRoutes(app: FastifyInstance): Promise<void> {
@@ -30,35 +44,44 @@ export async function apiRoutes(app: FastifyInstance): Promise<void> {
       config: { rateLimit: { max: 60, timeWindow: '1 minute' } },
     },
     async (request, reply) => {
-      const part = await request.file()
-      if (!part) throw new UploadError(400, 'No file was included in the request.')
-
-      let buffer: Buffer
-      try {
-        buffer = await part.toBuffer()
-      } catch (err) {
-        if ((err as { code?: string }).code === 'FST_REQ_FILE_TOO_LARGE') {
-          throw new UploadError(
-            413,
-            `That file is larger than the ${Math.floor(config.maxUploadBytes / 1024 / 1024)} MB limit.`,
-          )
-        }
-        throw err
+      // Refused on the declared size before a byte is read. The real limit is
+      // still enforced below, for clients that understate or omit it.
+      const declared = Number(request.headers['content-length'])
+      const known = Number.isFinite(declared) && declared > 0
+      if (known && declared > config.maxUploadBytes + MULTIPART_OVERHEAD) {
+        throw new UploadError(413, tooLargeMessage())
       }
 
-      const drop = await storeUpload({
-        buffer,
-        filename: part.filename,
-        // requireAuth guarantees a user by the time the handler runs.
-        ownerEmail: request.user!.email,
-        ttlSeconds: clampTtl(request.query.ttl ?? config.defaultTtlSeconds),
-      })
+      // The reservation covers the whole request, because the bytes stay in
+      // memory from `toBuffer()` until the last object reaches R2.
+      return withUploadBudget(known ? declared : config.maxUploadBytes, async () => {
+        const part = await request.file()
+        if (!part) throw new UploadError(400, 'No file was included in the request.')
 
-      request.log.info(
-        { id: drop.id, kind: drop.kind, size: drop.size, entries: drop.entryCount },
-        'stored drop',
-      )
-      return reply.code(201).send(toOwnerView(drop))
+        let buffer: Buffer
+        try {
+          buffer = await part.toBuffer()
+        } catch (err) {
+          if ((err as { code?: string }).code === 'FST_REQ_FILE_TOO_LARGE') {
+            throw new UploadError(413, tooLargeMessage())
+          }
+          throw err
+        }
+
+        const drop = await storeUpload({
+          buffer,
+          filename: part.filename,
+          // requireAuth guarantees a user by the time the handler runs.
+          ownerEmail: request.user!.email,
+          ttlSeconds: clampTtl(request.query.ttl ?? config.defaultTtlSeconds),
+        })
+
+        request.log.info(
+          { id: drop.id, kind: drop.kind, size: drop.size, entries: drop.entryCount },
+          'stored drop',
+        )
+        return reply.code(201).send(toOwnerView(drop))
+      })
     },
   )
 

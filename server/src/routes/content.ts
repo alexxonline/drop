@@ -70,10 +70,19 @@ interface SiteParams extends IdParams {
   '*': string
 }
 
+/**
+ * A single page legitimately fans out into one request per asset, and a media
+ * player issues a range request per seek, so these sit well above the app's
+ * default ceiling — high enough not to hurt a real visitor, low enough to keep
+ * a scraper from turning one link into unbounded R2 egress.
+ */
+const CONTENT_RATE_LIMIT = { max: 1200, timeWindow: '1 minute' }
+
 export async function contentRoutes(app: FastifyInstance): Promise<void> {
   /** Raw bytes: images, audio, PDFs, text, and downloads of any kind. */
   app.get<{ Params: IdParams; Querystring: { download?: string } }>(
     '/f/:id',
+    { config: { rateLimit: CONTENT_RATE_LIMIT } },
     async (request, reply) => {
       const result = drops.resolve(request.params.id)
 
@@ -114,26 +123,30 @@ export async function contentRoutes(app: FastifyInstance): Promise<void> {
    * The share-card thumbnail. Chat and social crawlers fetch this URL from
    * `og:image`, so it stays small and always JPEG — see preview.ts.
    */
-  app.get<{ Params: IdParams }>('/f/:id/preview', async (request, reply) => {
-    const result = drops.resolve(request.params.id)
+  app.get<{ Params: IdParams }>(
+    '/f/:id/preview',
+    { config: { rateLimit: CONTENT_RATE_LIMIT } },
+    async (request, reply) => {
+      const result = drops.resolve(request.params.id)
 
-    if (result.status === 'missing') {
-      return reply.code(404).send({ error: 'not-found' })
-    }
-    if (result.status === 'expired') {
-      return reply.code(410).send({ error: 'expired' })
-    }
-    if (!result.drop.previewWidth) {
-      return reply.code(404).send({ error: 'not-found' })
-    }
+      if (result.status === 'missing') {
+        return reply.code(404).send({ error: 'not-found' })
+      }
+      if (result.status === 'expired') {
+        return reply.code(410).send({ error: 'expired' })
+      }
+      if (!result.drop.previewWidth) {
+        return reply.code(404).send({ error: 'not-found' })
+      }
 
-    const res = await getObject(previewKey(result.drop.prefix))
-    if (!res) return reply.code(404).send({ error: 'not-found' })
+      const res = await getObject(previewKey(result.drop.prefix))
+      if (!res) return reply.code(404).send({ error: 'not-found' })
 
-    reply.header('cross-origin-resource-policy', 'cross-origin')
+      reply.header('cross-origin-resource-policy', 'cross-origin')
 
-    return relay(reply, res, { contentType: PREVIEW_MIME, cacheControl: 'public, max-age=300' })
-  })
+      return relay(reply, res, { contentType: PREVIEW_MIME, cacheControl: 'public, max-age=300' })
+    },
+  )
 
   // Relative links inside a site only resolve correctly from a trailing slash.
   app.get<{ Params: IdParams }>('/s/:id', async (request, reply) =>
@@ -141,50 +154,54 @@ export async function contentRoutes(app: FastifyInstance): Promise<void> {
   )
 
   /** Static site assets for `html` and `site` drops. */
-  app.get<{ Params: SiteParams }>('/s/:id/*', async (request, reply) => {
-    const result = drops.resolve(request.params.id)
+  app.get<{ Params: SiteParams }>(
+    '/s/:id/*',
+    { config: { rateLimit: CONTENT_RATE_LIMIT } },
+    async (request, reply) => {
+      const result = drops.resolve(request.params.id)
 
-    if (result.status === 'missing') {
-      return statusPage(reply, 404, 'Not found', 'This link does not exist.')
-    }
-    if (result.status === 'expired') {
-      return statusPage(
-        reply,
-        410,
-        'Link expired',
-        'This upload reached its expiry time and has been deleted.',
-      )
-    }
+      if (result.status === 'missing') {
+        return statusPage(reply, 404, 'Not found', 'This link does not exist.')
+      }
+      if (result.status === 'expired') {
+        return statusPage(
+          reply,
+          410,
+          'Link expired',
+          'This upload reached its expiry time and has been deleted.',
+        )
+      }
 
-    const drop = result.drop
-    if (!SITE_KINDS.has(drop.kind)) {
-      return statusPage(reply, 404, 'Not found', 'This link is not a site.')
-    }
+      const drop = result.drop
+      if (!SITE_KINDS.has(drop.kind)) {
+        return statusPage(reply, 404, 'Not found', 'This link is not a site.')
+      }
 
-    const requested = request.params['*'] || ''
-    if (requested.split('/').includes('..')) {
-      return statusPage(reply, 400, 'Bad request', 'That path is not allowed.')
-    }
+      const requested = request.params['*'] || ''
+      if (requested.split('/').includes('..')) {
+        return statusPage(reply, 400, 'Bad request', 'That path is not allowed.')
+      }
 
-    const base = `${drop.prefix}site/`
-    const relative =
-      requested === '' || requested.endsWith('/') ? `${requested}index.html` : requested
+      const base = `${drop.prefix}site/`
+      const relative =
+        requested === '' || requested.endsWith('/') ? `${requested}index.html` : requested
 
-    let res = await getObject(base + relative)
-    if (!res && !requested.endsWith('/') && requested !== '') {
-      // Directory-style URL without the trailing slash.
-      res = await getObject(`${base + requested}/index.html`)
-    }
-    if (!res) {
-      return statusPage(reply, 404, 'Not found', 'That page is not part of this upload.')
-    }
+      let res = await getObject(base + relative)
+      if (!res && !requested.endsWith('/') && requested !== '') {
+        // Directory-style URL without the trailing slash.
+        res = await getObject(`${base + requested}/index.html`)
+      }
+      if (!res) {
+        return statusPage(reply, 404, 'Not found', 'That page is not part of this upload.')
+      }
 
-    // Embeddable by the viewer's top bar, but not by arbitrary third parties.
-    reply.header('content-security-policy', `frame-ancestors 'self' ${config.appOrigin}`)
+      // Embeddable by the viewer's top bar, but not by arbitrary third parties.
+      reply.header('content-security-policy', `frame-ancestors 'self' ${config.appOrigin}`)
 
-    return relay(reply, res, {
-      contentType: res.headers.get('content-type') ?? 'application/octet-stream',
-      cacheControl: 'public, max-age=300',
-    })
-  })
+      return relay(reply, res, {
+        contentType: res.headers.get('content-type') ?? 'application/octet-stream',
+        cacheControl: 'public, max-age=300',
+      })
+    },
+  )
 }

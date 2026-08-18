@@ -74,10 +74,23 @@ async function readSession(request: FastifyRequest): Promise<SessionUser | null>
   }
 }
 
-/** Only same-site relative paths, so `next` can't be turned into an open redirect. */
+/**
+ * Only same-origin paths, so `next` can't be turned into an open redirect.
+ *
+ * Resolved rather than pattern-matched: browsers normalise backslashes to
+ * slashes for special schemes, so `/\evil.com` parses as `//evil.com` and
+ * lands on another origin, which a `startsWith('//')` test does not catch.
+ */
 function safeNext(value: unknown): string {
-  if (typeof value !== 'string' || !value.startsWith('/') || value.startsWith('//')) return '/'
-  return value
+  if (typeof value !== 'string' || !value.startsWith('/')) return '/'
+
+  try {
+    const url = new URL(value, config.appOrigin)
+    if (url.origin !== config.appOrigin) return '/'
+    return `${url.pathname}${url.search}${url.hash}`
+  } catch {
+    return '/'
+  }
 }
 
 interface TokenResponse {

@@ -39,6 +39,8 @@ function origin(name: string, fallback: string): string {
 
 const isProd = process.env.NODE_ENV === 'production'
 
+const maxUploadBytes = int('MAX_UPLOAD_BYTES', 100 * 1024 * 1024)
+
 const appOrigin = origin('APP_ORIGIN', 'http://localhost:5173')
 const contentOrigin = origin('CONTENT_ORIGIN', '') || appOrigin
 
@@ -46,6 +48,13 @@ export const config = {
   isProd,
   port: int('PORT', 3000),
   host: str('HOST', '0.0.0.0'),
+  /**
+   * Which peers may set X-Forwarded-For. Trusting every hop (`true`) lets any
+   * client claim any IP, which forges the address the rate limiter and the logs
+   * work from. The default covers a reverse proxy on the same host and the
+   * private ranges Docker publishes ports from, and nothing routable.
+   */
+  trustProxy: str('TRUST_PROXY', 'loopback, linklocal, uniquelocal'),
 
   appOrigin,
   contentOrigin,
@@ -80,17 +89,26 @@ export const config = {
   databasePath: path.resolve(rootDir, str('DATABASE_PATH', './data/drop.db')),
   webDist: path.join(rootDir, 'web', 'dist'),
 
-  maxUploadBytes: int('MAX_UPLOAD_BYTES', 100 * 1024 * 1024),
+  maxUploadBytes,
+  /**
+   * Ceiling on upload bytes held in memory at once. Every upload is buffered
+   * whole — the SigV4 payload hash needs the bytes up front — so what bounds
+   * RSS is a byte budget, not a request count: ten 200 KB uploads and ten
+   * 100 MB ones cost wildly different amounts of memory.
+   */
+  uploadMemoryBudgetBytes: int('UPLOAD_MEMORY_BUDGET_BYTES', maxUploadBytes * 3),
   defaultTtlSeconds: int('DEFAULT_TTL_SECONDS', 24 * 60 * 60),
   maxTtlSeconds: int('MAX_TTL_SECONDS', 30 * 24 * 60 * 60),
   minTtlSeconds: 60,
   sweepIntervalMs: int('SWEEP_INTERVAL_MS', 60_000),
+  /** Requests per minute per IP, before route-level overrides. */
+  rateLimitPerMinute: int('RATE_LIMIT_PER_MINUTE', 600),
   maxZipEntries: int('MAX_ZIP_ENTRIES', 2000),
   maxZipTotalBytes: int('MAX_ZIP_TOTAL_BYTES', 300 * 1024 * 1024),
   /** Guards against archives that expand catastrophically. */
   maxZipRatio: 200,
-  /** Concurrent in-flight uploads; each buffers up to maxUploadBytes. */
-  uploadConcurrency: 3,
+  /** Objects written to R2 at once, and so entry buffers alive at once. */
+  objectConcurrency: 6,
 }
 
 /** Throws with every problem at once, rather than one boot failure at a time. */
@@ -105,6 +123,9 @@ export function assertConfig(): void {
   }
   if (config.maxTtlSeconds < config.defaultTtlSeconds) {
     problems.push('MAX_TTL_SECONDS must be >= DEFAULT_TTL_SECONDS')
+  }
+  if (config.uploadMemoryBudgetBytes < config.maxUploadBytes) {
+    problems.push('UPLOAD_MEMORY_BUDGET_BYTES must be >= MAX_UPLOAD_BYTES')
   }
   if (config.isProd && config.sharedOrigin) {
     problems.push(

@@ -24,11 +24,21 @@
 (app_upstream) {
 	# docker-compose.yml binds the app to loopback on this port.
 	# Caddy sets X-Forwarded-{For,Proto,Host} itself; the app reads them
-	# because it runs with trustProxy enabled.
+	# because it trusts this hop (TRUST_PROXY). The origin split itself routes
+	# on the Host header, which is passed through untouched.
 	#
 	# The long timeouts are for uploads: 100 MB over a 1 Mbit uplink is roughly
 	# 15 minutes, and the default 3 minutes would cut that off mid-transfer.
 	reverse_proxy 127.0.0.1:3000 {
+		# Overwrite rather than forward. Caddy only *adds* these when the client
+		# did not send them, and the app routes on the hostname — a client-supplied
+		# X-Forwarded-Host would otherwise let it pick which of the two origins it
+		# is talking to. Replacing X-Forwarded-For likewise pins the client IP the
+		# rate limiter sees. Behind another proxy (Cloudflare and friends), drop
+		# the X-Forwarded-For line or the real client IP is lost.
+		header_up X-Forwarded-Host {host}
+		header_up X-Forwarded-For {remote_host}
+
 		transport http {
 			read_timeout 30m
 			write_timeout 30m

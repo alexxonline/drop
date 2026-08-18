@@ -1,7 +1,7 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import Fastify from 'fastify'
-import type { FastifyError, FastifyInstance } from 'fastify'
+import type { FastifyError, FastifyInstance, FastifyReply, FastifyRequest } from 'fastify'
 import cookie from '@fastify/cookie'
 import multipart from '@fastify/multipart'
 import rateLimit from '@fastify/rate-limit'
@@ -14,9 +14,62 @@ import { shareRoutes } from './routes/share.ts'
 import { UploadError } from './uploads.ts'
 import { ZipError } from './zip.ts'
 
-/** Paths that belong to CONTENT_ORIGIN rather than the app. */
+/** Route patterns served from CONTENT_ORIGIN. Kept in step with routes/content.ts. */
+const CONTENT_ROUTES: ReadonlySet<string> = new Set([
+  '/f/:id',
+  '/f/:id/preview',
+  '/s/:id',
+  '/s/:id/*',
+])
+
+/**
+ * Paths that belong to CONTENT_ORIGIN rather than the app.
+ *
+ * Matched against the *decoded* path, because the router decodes before it
+ * matches: `/%73/<id>/` reaches the `/s/:id/*` handler while a raw prefix check
+ * on `request.url` reads it as an app path. A path that will not decode counts
+ * as content, so a malformed URL fails towards refusing to serve it here.
+ */
 function isContentPath(url: string): boolean {
-  return url.startsWith('/f/') || url.startsWith('/s/') || url === '/s'
+  const raw = url.split(/[?#]/)[0]
+
+  let path: string
+  try {
+    path = decodeURIComponent(raw)
+  } catch {
+    return true
+  }
+  return path.startsWith('/f/') || path.startsWith('/s/') || path === '/s'
+}
+
+/**
+ * Whether a request targets user content. Prefers the pattern the router
+ * actually matched — no encoding trick survives that — and falls back to the
+ * path for requests that matched no route at all.
+ */
+function isContentRequest(request: FastifyRequest): boolean {
+  const pattern = request.routeOptions?.url
+  if (pattern !== undefined) return CONTENT_ROUTES.has(pattern)
+  return isContentPath(request.url)
+}
+
+/**
+ * Refuses a whole family of routes on the wrong hostname. Bound to the routes
+ * themselves rather than to a URL prefix, so the boundary holds even if the
+ * classifier above is ever fooled again, and a route added later inherits it.
+ *
+ * `request.headers.host`, deliberately, not `request.host`: with `trustProxy`
+ * on, the latter prefers `X-Forwarded-Host`, and a reverse proxy will forward a
+ * client-supplied one untouched. The Host header is what the proxy matched its
+ * own site block on.
+ */
+function hostGuard(expected: string) {
+  return async function guard(request: FastifyRequest, reply: FastifyReply): Promise<void> {
+    if (config.sharedOrigin) return
+    if ((request.headers.host ?? '') !== expected) {
+      await reply.code(404).send({ error: 'not-found' })
+    }
+  }
 }
 
 function contentSecurityPolicy(): string {
@@ -48,7 +101,7 @@ export async function buildApp(): Promise<FastifyInstance> {
       level: process.env.LOG_LEVEL || 'info',
       transport: config.isProd ? undefined : { target: 'pino-pretty', options: { colorize: true } },
     },
-    trustProxy: true,
+    trustProxy: config.trustProxy,
     bodyLimit: 1024 * 1024,
   })
 
@@ -56,9 +109,12 @@ export async function buildApp(): Promise<FastifyInstance> {
   await app.register(multipart, {
     limits: { fileSize: config.maxUploadBytes, files: 1, fields: 5, parts: 10 },
   })
+  // On by default rather than opt-in: every unlisted route was unlimited, and
+  // the content routes each turn into an R2 round-trip. Routes that legitimately
+  // burst raise their own ceiling; see routes/content.ts.
   await app.register(rateLimit, {
-    global: false,
-    max: 600,
+    global: true,
+    max: config.rateLimitPerMinute,
     timeWindow: '1 minute',
     hook: 'onRequest',
   })
@@ -72,8 +128,8 @@ export async function buildApp(): Promise<FastifyInstance> {
     app.addHook('onRequest', async (request, reply) => {
       if (request.url === '/health') return
 
-      const onContentHost = request.host === config.contentHost
-      const wantsContent = isContentPath(request.url)
+      const onContentHost = request.headers.host === config.contentHost
+      const wantsContent = isContentRequest(request)
 
       if (onContentHost !== wantsContent) {
         await reply.code(404).send({ error: 'not-found' })
@@ -88,7 +144,7 @@ export async function buildApp(): Promise<FastifyInstance> {
 
   const csp = contentSecurityPolicy()
   app.addHook('onRequest', async (request, reply) => {
-    if (isContentPath(request.url)) return
+    if (isContentRequest(request)) return
     reply.headers({
       'content-security-policy': csp,
       'x-content-type-options': 'nosniff',
@@ -113,16 +169,21 @@ export async function buildApp(): Promise<FastifyInstance> {
     return reply.code(500).send({ error: 'internal', message: 'Something went wrong.' })
   })
 
-  app.get('/health', async () => ({ ok: true }))
+  // Unlimited: the container's own health check calls it on a fixed interval.
+  app.get('/health', { config: { rateLimit: false } }, async () => ({ ok: true }))
 
   // Auth and API share one encapsulated context so the session hook runs for
   // them and not for content requests.
   await app.register(async (scope) => {
+    scope.addHook('onRequest', hostGuard(config.appHost))
     await authRoutes(scope)
     await apiRoutes(scope)
   })
 
-  await app.register(contentRoutes)
+  await app.register(async (scope) => {
+    scope.addHook('onRequest', hostGuard(config.contentHost))
+    await contentRoutes(scope)
+  })
 
   const indexPath = path.join(config.webDist, 'index.html')
   const hasBuild = fs.existsSync(indexPath)
@@ -136,7 +197,7 @@ export async function buildApp(): Promise<FastifyInstance> {
   }
 
   app.setNotFoundHandler(async (request, reply) => {
-    const isAppHost = config.sharedOrigin || request.host === config.appHost
+    const isAppHost = config.sharedOrigin || request.headers.host === config.appHost
     const isPage =
       request.method === 'GET' &&
       !request.url.startsWith('/api/') &&

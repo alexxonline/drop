@@ -8,6 +8,7 @@ import type { Preview } from './preview.ts'
 import { classify, sanitiseFilename, siteAssetType, SITE_KINDS } from './types.ts'
 import type { DropKind } from './types.ts'
 import { extractSite } from './zip.ts'
+import type { ExtractedSite } from './zip.ts'
 
 export class UploadError extends Error {
   readonly statusCode: number
@@ -20,47 +21,87 @@ export class UploadError extends Error {
 }
 
 /**
- * Caps concurrent uploads. Each one buffers the whole file to memory so the
- * SigV4 payload hash can be computed, and MAX_UPLOAD_BYTES is 100 MB.
+ * Admission control for the memory an upload occupies while it is in flight.
+ *
+ * Every upload is buffered whole — the SigV4 payload hash needs the bytes up
+ * front — so the ceiling has to be counted in bytes rather than in requests:
+ * capping the number of concurrent uploads bounds nothing when each one may be
+ * 100 MB, and makes small uploads queue behind each other for no reason.
+ * Callers reserve before they read, and wait when the budget is spent.
  */
-class Semaphore {
+class ByteBudget {
+  readonly #limit: number
   #free: number
-  #waiting: Array<() => void> = []
+  #waiting: Array<{ size: number; wake: () => void }> = []
 
   constructor(limit: number) {
+    this.#limit = limit
     this.#free = limit
   }
 
-  async acquire(): Promise<void> {
-    if (this.#free > 0) {
-      this.#free -= 1
-      return
+  /** Resolves once `size` bytes are held, and returns the amount to release. */
+  async acquire(size: number): Promise<number> {
+    const want = Math.min(Math.max(size, 0), this.#limit)
+
+    if (this.#waiting.length === 0 && want <= this.#free) {
+      this.#free -= want
+      return want
     }
-    await new Promise<void>((resolve) => this.#waiting.push(resolve))
+    await new Promise<void>((wake) => this.#waiting.push({ size: want, wake }))
+    return want
   }
 
-  release(): void {
-    const next = this.#waiting.shift()
-    if (next) next()
-    else this.#free += 1
+  release(size: number): void {
+    this.#free += size
+
+    // Strictly in order, even when a smaller request further back would fit:
+    // letting it barge means a steady trickle of small uploads can starve a
+    // large one indefinitely.
+    while (this.#waiting.length > 0 && this.#waiting[0]!.size <= this.#free) {
+      const next = this.#waiting.shift()!
+      this.#free -= next.size
+      next.wake()
+    }
   }
 }
 
-const slots = new Semaphore(config.uploadConcurrency)
+const budget = new ByteBudget(config.uploadMemoryBudgetBytes)
+
+/**
+ * Runs `fn` with room for `size` bytes reserved.
+ *
+ * `size` comes from the request's own Content-Length, so a client that lies
+ * under-reserves; the per-request MAX_UPLOAD_BYTES limit still caps what any
+ * one upload can actually buffer, and uploads are rate limited on top.
+ */
+export async function withUploadBudget<T>(size: number, fn: () => Promise<T>): Promise<T> {
+  const reserved = await budget.acquire(size)
+  try {
+    return await fn()
+  } finally {
+    budget.release(reserved)
+  }
+}
 
 interface PendingObject {
   key: string
-  data: Buffer
+  read: () => Promise<Buffer>
   contentType: string
 }
 
-async function uploadAll(objects: PendingObject[], concurrency = 6): Promise<void> {
+/**
+ * Writes objects to R2, at most `objectConcurrency` at a time. Bytes are read
+ * inside the worker that uploads them, so a 2000-entry site holds a handful of
+ * buffers in memory rather than all of them.
+ */
+async function uploadAll(objects: PendingObject[]): Promise<void> {
   const queue = [...objects]
+  const width = Math.min(config.objectConcurrency, queue.length)
 
-  const workers = Array.from({ length: Math.min(concurrency, queue.length) }, async () => {
+  const workers = Array.from({ length: width }, async () => {
     let next: PendingObject | undefined
     while ((next = queue.pop()) !== undefined) {
-      await putObject(next.key, next.data, next.contentType)
+      await putObject(next.key, await next.read(), next.contentType)
     }
   })
   await Promise.all(workers)
@@ -97,77 +138,77 @@ export async function storeUpload({
   const prefix = `drops/${id}/`
   const safeName = sanitiseFilename(filename)
 
-  await slots.acquire()
-  try {
-    const objects: PendingObject[] = []
-    let entryCount = 1
-    let objectKey: string
-    let preview: Preview | null = null
+  const objects: PendingObject[] = []
+  const whole = async () => buffer
+  let entryCount = 1
+  let objectKey: string
+  let preview: Preview | null = null
+  let site: ExtractedSite | null = null
 
-    if (type.kind === 'site') {
-      const { files } = await extractSite(buffer)
-      entryCount = files.length
-      objectKey = `${prefix}original/${safeName}`
+  if (type.kind === 'site') {
+    site = await extractSite(buffer)
+    entryCount = site.entries.length
+    objectKey = `${prefix}original/${safeName}`
 
-      for (const file of files) {
+    for (const entry of site.entries) {
+      objects.push({
+        key: `${prefix}site/${entry.path}`,
+        read: entry.read,
+        contentType: siteAssetType(entry.path),
+      })
+    }
+    // Kept alongside the unpacked site so the top bar can still offer a download.
+    objects.push({ key: objectKey, read: whole, contentType: type.mime })
+  } else if (type.kind === 'html') {
+    objectKey = `${prefix}site/index.html`
+    objects.push({ key: objectKey, read: whole, contentType: type.mime })
+  } else {
+    objectKey = `${prefix}${safeName}`
+    objects.push({ key: objectKey, read: whole, contentType: type.mime })
+
+    if (type.kind === 'image') {
+      try {
+        preview = await makePreview(buffer)
+        const data = preview.data
         objects.push({
-          key: `${prefix}site/${file.path}`,
-          data: file.data,
-          contentType: siteAssetType(file.path),
+          key: previewKey(prefix),
+          read: async () => data,
+          contentType: PREVIEW_MIME,
         })
-      }
-      // Kept alongside the unpacked site so the top bar can still offer a download.
-      objects.push({ key: objectKey, data: buffer, contentType: type.mime })
-    } else if (type.kind === 'html') {
-      objectKey = `${prefix}site/index.html`
-      objects.push({ key: objectKey, data: buffer, contentType: type.mime })
-    } else {
-      objectKey = `${prefix}${safeName}`
-      objects.push({ key: objectKey, data: buffer, contentType: type.mime })
-
-      if (type.kind === 'image') {
-        try {
-          preview = await makePreview(buffer)
-          objects.push({
-            key: previewKey(prefix),
-            data: preview.data,
-            contentType: PREVIEW_MIME,
-          })
-        } catch {
-          // A share-card thumbnail is a nicety. An image sharp cannot decode
-          // still uploads and still renders in the viewer; it just gets a
-          // text-only preview when the link is pasted into a chat app.
-          preview = null
-        }
+      } catch {
+        // A share-card thumbnail is a nicety. An image sharp cannot decode
+        // still uploads and still renders in the viewer; it just gets a
+        // text-only preview when the link is pasted into a chat app.
+        preview = null
       }
     }
-
-    try {
-      await uploadAll(objects)
-    } catch (err) {
-      await deletePrefix(prefix).catch(() => {})
-      throw err
-    }
-
-    const now = Date.now()
-    return drops.create({
-      id,
-      ownerEmail,
-      filename: safeName,
-      kind: type.kind,
-      mime: type.mime,
-      size: buffer.length,
-      objectKey,
-      prefix,
-      entryCount,
-      previewWidth: preview?.width ?? null,
-      previewHeight: preview?.height ?? null,
-      createdAt: now,
-      expiresAt: now + ttlSeconds * 1000,
-    })
-  } finally {
-    slots.release()
   }
+
+  try {
+    await uploadAll(objects)
+  } catch (err) {
+    await deletePrefix(prefix).catch(() => {})
+    throw err
+  } finally {
+    site?.close()
+  }
+
+  const now = Date.now()
+  return drops.create({
+    id,
+    ownerEmail,
+    filename: safeName,
+    kind: type.kind,
+    mime: type.mime,
+    size: buffer.length,
+    objectKey,
+    prefix,
+    entryCount,
+    previewWidth: preview?.width ?? null,
+    previewHeight: preview?.height ?? null,
+    createdAt: now,
+    expiresAt: now + ttlSeconds * 1000,
+  })
 }
 
 /** Removes every object for a drop and tombstones the row. Safe to repeat. */
