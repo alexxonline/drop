@@ -1,0 +1,20 @@
+services:
+  drop:
+    build: .
+    image: drop
+    restart: unless-stopped
+    init: true
+    env_file: .env
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      DATABASE_PATH: /app/data/drop.db
+    ports:
+      # Bound to loopback: terminate TLS in front of this (Caddy, nginx,
+      # Cloudflare tunnel) and point both hostnames at it.
+      - '127.0.0.1:3000:3000'
+    volumes:
+      - drop-data:/app/data
+
+volumes:
+  drop-data:

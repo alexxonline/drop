@@ -1,0 +1,76 @@
+# Caddy in front of drop.
+#
+# Two hostnames, one upstream. The app itself routes by Host header, so both
+# names point at the same process — there is no second container (SPEC.md §7):
+#
+#   drop.example.com         the UI, the API, and every share link
+#   usercontent.example.com  raw uploaded bytes and unpacked sites, nothing else
+#
+# Caddy obtains certificates for both names automatically and passes the
+# original Host header through untouched, which is exactly what the app routes
+# on. Nothing here needs to know about /f or /s.
+#
+# Usage:
+#   1. Replace both hostnames below.
+#   2. Point both DNS A/AAAA records at this server.
+#   3. Set APP_ORIGIN and CONTENT_ORIGIN in .env to the matching https:// URLs.
+#   4. cp Caddyfile /etc/caddy/Caddyfile
+#      caddy validate --config /etc/caddy/Caddyfile
+#      systemctl reload caddy
+#
+# For expiry notices from Let's Encrypt, add a global block above the sites:
+#   { email you@example.com }
+
+(app_upstream) {
+	# docker-compose.yml binds the app to loopback on this port.
+	# Caddy sets X-Forwarded-{For,Proto,Host} itself; the app reads them
+	# because it runs with trustProxy enabled.
+	#
+	# The long timeouts are for uploads: 100 MB over a 1 Mbit uplink is roughly
+	# 15 minutes, and the default 3 minutes would cut that off mid-transfer.
+	reverse_proxy 127.0.0.1:3000 {
+		transport http {
+			read_timeout 30m
+			write_timeout 30m
+		}
+	}
+}
+
+# --- app origin --------------------------------------------------------------
+# Security headers (CSP, nosniff, frame-ancestors) are set by the app per route,
+# because they differ between app pages and user content. Do not duplicate them
+# here — two sources of truth will drift.
+
+drop.example.com {
+	encode zstd gzip
+
+	# Outer guard only. The app enforces MAX_UPLOAD_BYTES itself and returns a
+	# proper 413 with a readable message, so keep this comfortably above that
+	# value to leave room for multipart framing.
+	request_body {
+		max_size 120MB
+	}
+
+	import app_upstream
+
+	# HSTS is a one-way door: browsers remember it for max-age and will refuse
+	# plain HTTP to this host until it expires. Uncomment once you are certain
+	# the domain stays on HTTPS.
+	# header Strict-Transport-Security "max-age=31536000; includeSubDomains"
+}
+
+# --- content origin ----------------------------------------------------------
+# Everything served here is attacker-controlled. It is a separate origin so that
+# uploaded JavaScript has no access to the session cookie, which is host-only
+# and therefore never sent to this name.
+
+usercontent.example.com {
+	encode zstd gzip
+
+	# Read-only: no route on this host accepts a request body.
+	request_body {
+		max_size 64KB
+	}
+
+	import app_upstream
+}
