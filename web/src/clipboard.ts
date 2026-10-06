@@ -74,3 +74,40 @@ export function isEditable(target: EventTarget | null): boolean {
   if (target.isContentEditable) return true
   return target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement
 }
+
+/**
+ * Whether the async Clipboard API can hand us more than text. Phones have no
+ * Ctrl+V, so this is how a tap on a button reaches the clipboard at all.
+ */
+export function canReadClipboard(): boolean {
+  return typeof navigator.clipboard?.read === 'function'
+}
+
+/**
+ * Reads the clipboard on request, for a tap on the "Paste" button. iOS shows
+ * its own confirm bubble and Android asks for permission once, so this must
+ * run straight from the user's gesture. Throws when the browser refuses; the
+ * caller falls back to a box the user long-presses to paste into.
+ *
+ * An image beats text when an item offers both (a copied picture often carries
+ * its URL as text too). HTML is skipped: its plain-text twin is what people mean.
+ */
+export async function readClipboard(): Promise<File | null> {
+  const items = await navigator.clipboard.read()
+
+  for (const item of items) {
+    const image = item.types.find((type) => type.startsWith('image/'))
+    if (image) {
+      const blob = await item.getType(image)
+      return named(new File([blob], '', { type: blob.type || image }))
+    }
+  }
+
+  for (const item of items) {
+    if (!item.types.includes('text/plain')) continue
+    const text = await (await item.getType('text/plain')).text()
+    if (text.trim()) return new File([text], `${stamp()}.txt`, { type: 'text/plain' })
+  }
+
+  return null
+}

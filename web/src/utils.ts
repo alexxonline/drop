@@ -57,6 +57,14 @@ export function kindLabel(kind: DropKind): string {
   return KIND_LABELS[kind] ?? kind
 }
 
+/**
+ * A phone or tablet with no mouse: no drag and drop, no keyboard shortcuts.
+ * Asks about the primary pointer, so a touchscreen laptop still counts as a desktop.
+ */
+export function isTouchDevice(): boolean {
+  return matchMedia('(pointer: coarse)').matches
+}
+
 /** Mac shows ⌘ where the rest show Ctrl; a shortcut hint has to name the real key. */
 export function pasteShortcut(): string {
   return /mac|iphone|ipad/i.test(navigator.userAgent) ? '⌘V' : 'Ctrl+V'

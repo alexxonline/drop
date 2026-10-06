@@ -3,8 +3,10 @@ import { api } from '../api.ts'
 import { Dropzone } from '../components/Dropzone.tsx'
 import { CopyField } from '../components/CopyField.tsx'
 import type { OwnerDrop, UploadSettings } from '../types.ts'
-import { formatBytes, formatDate, kindLabel } from '../utils.ts'
-import { fileFromClipboard, isEditable } from '../clipboard.ts'
+import { formatBytes, formatDate, isTouchDevice, kindLabel } from '../utils.ts'
+import { canReadClipboard, fileFromClipboard, isEditable, readClipboard } from '../clipboard.ts'
+
+const EMPTY_CLIPBOARD = 'There was no file, image, or text in the clipboard.'
 
 export function Upload() {
   const [settings, setSettings] = useState<UploadSettings | null>(null)
@@ -65,7 +67,7 @@ export function Upload() {
 
       const file = fileFromClipboard(event)
       if (!file) {
-        setError('There was no file, image, or text in the clipboard.')
+        setError(EMPTY_CLIPBOARD)
         return
       }
 
@@ -108,6 +110,13 @@ export function Upload() {
             }
           />
 
+          {isTouchDevice() && !uploading && (
+            <TouchPaste
+              onFile={(file) => void handleFile(file)}
+              onEmpty={() => setError(EMPTY_CLIPBOARD)}
+            />
+          )}
+
           {uploading ? (
             <div class="progress" role="progressbar" aria-valuenow={Math.round(progress * 100)}>
               <div class="progress-bar" style={{ width: `${Math.round(progress * 100)}%` }} />
@@ -133,6 +142,61 @@ export function Upload() {
         </>
       )}
     </div>
+  )
+}
+
+/**
+ * Pasting on a phone, where there is no Ctrl+V. The button reads the clipboard
+ * directly; when the browser has no Clipboard API or refuses it (the user
+ * dismissed the iOS Paste bubble, or denied the Android permission), it gives
+ * way to a box the user long-presses to get the system Paste menu.
+ *
+ * The box is contenteditable rather than a textarea because iOS only hands a
+ * pasted image to contenteditable. Being editable, its paste is skipped by the
+ * page's window listener, so it handles its own; `inputMode="none"` keeps the
+ * keyboard from covering the screen when it is tapped.
+ */
+function TouchPaste({ onFile, onEmpty }: { onFile: (file: File) => void; onEmpty: () => void }) {
+  const [fallback, setFallback] = useState(!canReadClipboard())
+
+  const pasteFromButton = async () => {
+    try {
+      const file = await readClipboard()
+      if (file) onFile(file)
+      else onEmpty()
+    } catch {
+      setFallback(true)
+    }
+  }
+
+  if (!fallback) {
+    return (
+      <button type="button" class="button ghost paste-button" onClick={() => void pasteFromButton()}>
+        Paste from clipboard
+      </button>
+    )
+  }
+
+  return (
+    <div
+      class="paste-box"
+      contentEditable
+      inputMode="none"
+      role="textbox"
+      aria-label="Paste here"
+      data-placeholder="Touch and hold here, then tap Paste"
+      onPaste={(event) => {
+        event.preventDefault()
+        const file = fileFromClipboard(event)
+        if (file) onFile(file)
+        else onEmpty()
+      }}
+      // Anything the browser inserts despite preventDefault (or the user types)
+      // is not an upload; keep the box empty so the placeholder stays readable.
+      onInput={(event) => {
+        event.currentTarget.textContent = ''
+      }}
+    />
   )
 }
 

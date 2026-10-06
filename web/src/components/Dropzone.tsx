@@ -1,6 +1,6 @@
 import { useRef, useState, useCallback } from 'preact/hooks'
 import type { JSX } from 'preact'
-import { pasteShortcut } from '../utils.ts'
+import { isTouchDevice, pasteShortcut } from '../utils.ts'
 
 interface DropzoneProps {
   accept?: string | undefined
@@ -14,6 +14,7 @@ export function Dropzone({ accept, disabled = false, onFile, hint }: DropzonePro
   const [dragging, setDragging] = useState(false)
   // Drag events fire for every child element; a counter avoids flicker.
   const depth = useRef(0)
+  const touch = isTouchDevice()
 
   const pick = useCallback(
     (fileList: FileList | null | undefined) => {
@@ -80,10 +81,21 @@ export function Dropzone({ accept, disabled = false, onFile, hint }: DropzonePro
       <div class="dropzone-icon" aria-hidden="true">
         ↓
       </div>
-      <p class="dropzone-title">{dragging ? 'Release to upload' : 'Drop a file here'}</p>
-      {/* The paste itself is handled on the window by the Upload page: a paste
-          only reaches the focused element, and this one never demands focus. */}
-      <p class="dropzone-sub">or click to browse, or paste with {pasteShortcut()}</p>
+      {touch ? (
+        <>
+          {/* Phones can neither drag files in nor press Ctrl+V; the Upload
+              page puts a Paste button under the dropzone instead. */}
+          <p class="dropzone-title">Tap to choose a file</p>
+          <p class="dropzone-sub">from your photos, camera, or files</p>
+        </>
+      ) : (
+        <>
+          <p class="dropzone-title">{dragging ? 'Release to upload' : 'Drop a file here'}</p>
+          {/* The paste itself is handled on the window by the Upload page: a paste
+              only reaches the focused element, and this one never demands focus. */}
+          <p class="dropzone-sub">or click to browse, or paste with {pasteShortcut()}</p>
+        </>
+      )}
       {hint && <p class="dropzone-hint">{hint}</p>}
     </div>
   )
