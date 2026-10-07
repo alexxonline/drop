@@ -4,9 +4,28 @@ import { Dropzone } from '../components/Dropzone.tsx'
 import { CopyField } from '../components/CopyField.tsx'
 import type { OwnerDrop, UploadSettings } from '../types.ts'
 import { formatBytes, formatDate, isTouchDevice, kindLabel } from '../utils.ts'
-import { canReadClipboard, fileFromClipboard, isEditable, readClipboard } from '../clipboard.ts'
+import {
+  canReadClipboard,
+  fileFromClipboard,
+  isEditable,
+  LinkOnlyError,
+  readClipboard,
+} from '../clipboard.ts'
 
 const EMPTY_CLIPBOARD = 'There was no file, image, or text in the clipboard.'
+
+/**
+ * Turns a synchronous paste event into a file, or the message explaining why
+ * there is none. Shared by the window listener and the long-press box.
+ */
+function pastedFile(event: ClipboardEvent): File | string {
+  try {
+    return fileFromClipboard(event) ?? EMPTY_CLIPBOARD
+  } catch (err) {
+    if (err instanceof LinkOnlyError) return err.message
+    throw err
+  }
+}
 
 export function Upload() {
   const [settings, setSettings] = useState<UploadSettings | null>(null)
@@ -65,9 +84,9 @@ export function Upload() {
     const onPaste = (event: ClipboardEvent) => {
       if (isEditable(event.target)) return
 
-      const file = fileFromClipboard(event)
-      if (!file) {
-        setError(EMPTY_CLIPBOARD)
+      const file = pastedFile(event)
+      if (typeof file === 'string') {
+        setError(file)
         return
       }
 
@@ -113,7 +132,7 @@ export function Upload() {
           {isTouchDevice() && !uploading && (
             <TouchPaste
               onFile={(file) => void handleFile(file)}
-              onEmpty={() => setError(EMPTY_CLIPBOARD)}
+              onError={setError}
             />
           )}
 
@@ -156,16 +175,23 @@ export function Upload() {
  * page's window listener, so it handles its own; `inputMode="none"` keeps the
  * keyboard from covering the screen when it is tapped.
  */
-function TouchPaste({ onFile, onEmpty }: { onFile: (file: File) => void; onEmpty: () => void }) {
+function TouchPaste({
+  onFile,
+  onError,
+}: {
+  onFile: (file: File) => void
+  onError: (message: string) => void
+}) {
   const [fallback, setFallback] = useState(!canReadClipboard())
 
   const pasteFromButton = async () => {
     try {
       const file = await readClipboard()
       if (file) onFile(file)
-      else onEmpty()
-    } catch {
-      setFallback(true)
+      else onError(EMPTY_CLIPBOARD)
+    } catch (err) {
+      if (err instanceof LinkOnlyError) onError(err.message)
+      else setFallback(true)
     }
   }
 
@@ -187,9 +213,9 @@ function TouchPaste({ onFile, onEmpty }: { onFile: (file: File) => void; onEmpty
       data-placeholder="Touch and hold here, then tap Paste"
       onPaste={(event) => {
         event.preventDefault()
-        const file = fileFromClipboard(event)
-        if (file) onFile(file)
-        else onEmpty()
+        const file = pastedFile(event)
+        if (typeof file === 'string') onError(file)
+        else onFile(file)
       }}
       // Anything the browser inserts despite preventDefault (or the user types)
       // is not an upload; keep the box empty so the placeholder stays readable.
